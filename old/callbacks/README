@@ -1,0 +1,3 @@
+This is sample code for an event manager in C++ using fast delegates + binding.
+Note: An alternative would be to either use boost::bind or std::bind.
+

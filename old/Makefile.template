@@ -1,0 +1,13 @@
+# Generic C++ Makefile
+
+CPP = g++
+CPPFLAGS = -Wall
+LDFLAGS =
+
+# Compile the program.
+program : program.cc
+	$(CPP) $(CPPFLAGS) -o program program.cc $(LDFLAGS)
+
+# command to be executed.
+clean:
+	rm -f program

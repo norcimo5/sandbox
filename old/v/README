@@ -1,0 +1,6 @@
+Things to test:
+
+push_back
+pop_back
+obtaining iterator and iterating through the vector
+etc...

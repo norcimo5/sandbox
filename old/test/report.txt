@@ -1,0 +1,18 @@
+1) Previous Week - Planned
+
+     A) Complete testing of GEO-16190 (" Calibration needs to NOT use the ts_dister record for its time sync'ing " ) as soon as hw becomes available.
+     B) Complete testing of GEO-14478 ( "DRT quantization error queried at wrong time" ).
+     C) Work on GEO-15367 ( "Firefly calibration does not record Noise Floor or Uncertainties" ).
+
+2) Previous Week - Accomplished
+     A) Code complete and testing of GEO-14478:
+            -> Added timeout code and support for dynamic calibration.
+            -> Unit testing and static calibration almost complete but waiting on test results with timeout code and dynamic calibration.
+            -> Code review with Roderick Medina.
+
+     B) Worked on GEO-15367 and is now ready for some preliminary testing.
+
+3) Next Week - Planned
+     A) Mark GEO-14478 resolved + merge with main branch as soon as testing is completed.
+     B) Complete testing of GEO-16190 and GEO-15367 when test hardware becomes available.
+     C) Open for new tasks. 

@@ -1,0 +1,28 @@
+              class Employee
+                            {
+                                            public:
+                                                               Employee(string name, string dept);
+                                                                                virtual void print() const;
+                                                                                                 string dept() const;
+                                                                                                               private:
+                                                                                                                  string _name;
+                                                                                                                                   string _dept;
+                                                                                                                                                 };
+
+              class Manager : public Employee
+                                            {
+                                                            public:
+                                                                               Manager(string name, string dept);
+                                                                                                virtual void print() const;
+                                                                                                              private:
+                                                                                                                 // ...
+                                                                                                              };
+
+              void Employee::print() const
+                            {  cout << _name << endl;
+                                            }  
+
+              void Manager::print() const
+                            {  print(); // print base class
+                                               cout << dept() << endl;
+                                                             }  
