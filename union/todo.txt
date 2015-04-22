@@ -1,0 +1,3 @@
+I need to following functions:
+-> read binary data stream into structs (basically read header data)
+-> write structs back to binary stream

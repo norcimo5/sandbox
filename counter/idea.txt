@@ -1,0 +1,1 @@
+unsigned char symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567899`~!@#$%^&*()_-+={}[]\|:;\"'<>,.?/"

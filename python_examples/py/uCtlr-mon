@@ -1,0 +1,175 @@
+#!/bin/bash
+#
+# uCtlr-health-mon      This shell script starts up the uCtlr-health-mon
+#                     as a daemon at system boot time.
+#
+#                11 so it starts after the network ... we need that.
+#                   99 so it is one of the last to go down.
+#
+# chkconfig: 345 11 99
+# description: Start the uCtlr monitor
+# 
+# processname: uCtlr-mon
+# config: none
+# pidfile: none
+##########################################################################
+#
+# Revision Information
+#
+#
+##########################################################################
+#
+# Installation Instructions:
+#
+# These installation instruction work for Linux only.
+#
+# 1. You have to be root to install.
+# 2. This file should be copied to /etc/rc.d/init.d/uCtlr-health-mon
+# 3. run: chmod 755 /etc/rc.d/init.d/uCtlr-health-mon
+# 4. chkconfig --add uCtlr-health-mon  ... if needed
+#
+# NOTE: You must also install the configuration file in /etc/sysconfig
+#
+##########################################################################
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+
+# Source startup configuration if available
+if [ -f /etc/sysconfig/comintsys ]; then
+    . /etc/sysconfig/comintsys
+fi
+
+##########################################################################
+#
+#  the Log_name MUST be the same as the one in .../bin/uCtlr-mon
+#
+Log_name=uCtlr_status
+RUN_DIR=/h/GEOnet/bin
+RETVAL=0
+
+##########################################################################
+#
+start() {
+	# Start daemons.
+
+	echo -n $"Starting uCtlr-monitor: "
+
+# if already running ...
+
+	#uC_pid=`/sbin/pidof "uCtlr-monitor"`
+	uC_pid=`/bin/ps ax | grep -v grep | grep uCtlr-monitor | cut -d' ' -f2`
+	if [ "$uC_pid" ] ; then
+	    echo " ... already running ..."
+	    success
+	    echo
+	    return $RETVAL
+	fi
+
+	if ( ! lsmod | grep "coretemp" ) > /dev/null 2>&1 ; then
+	    echo -n "loading coretemp  "
+	    /sbin/modprobe coretemp
+	    sync
+	fi
+
+	cdir=`cd . && /bin/pwd`
+	cd $RUN_DIR
+	RETVAL=1
+
+	while [ $RETVAL -gt 0 -a $RETVAL -lt 1000001 ]; do
+		time=`date +%Y.%m.%d`
+		time_HMS=`date +%H:%M:%S`
+
+		if [ $RETVAL -gt 1 ]; then
+			echo -n $"ReStarting uCtlr monitor:                 "
+			echo $"#  ReStarting uCtlr monitor:  [ $time_HMS : $RETVAL ]" 1>>`ls -rt /tmp/$time-${Log_name}.log | tail -1`
+		fi
+		if [ -x ./uCtlr-monitor ] ; then
+			echo -n " [ $time_HMS ] "
+
+			touch /dev/shm/Starting_uCtlr-mon
+
+			$RUN_DIR/uCtlr-monitor dae tvl txt debug
+
+			sleep 2
+#			echo
+#			echo -n Checking /tmp/$time-${Log_name}.log
+
+			if [ -e /dev/shm/Starting_uCtlr-mon ]; then
+				#uC_pid=`/sbin/pidof "uCtlr-monitor"`
+				uC_pid=`/bin/ps ax | grep -v grep | grep uCtlr-monitor | cut -d' ' -f2`
+				if [ "$uC_pid" ] ; then
+					kill -9 $uC_pid
+				fi
+				failure
+				echo 
+				((RETVAL++))
+			else
+				success
+				RETVAL=0
+				touch /var/lock/subsys/uCtlr-mon
+			fi
+		fi
+	done
+
+	echo
+	cd $cdir
+
+	return $RETVAL
+}
+
+stop() {
+	echo -n $"Stopping uCtlr-monitor: "
+
+	#uC_pid=`/sbin/pidof "uCtlr-monitor"`
+	uC_pid=`/bin/ps ax | grep -v grep | grep uCtlr-monitor | cut -d' ' -f2`
+
+	#
+	#  We only send -INT since ../bin/uCtlr-mon is coded to go
+	#    down on just an -INT ... unless there is a pending cmd
+	#    from the uC for the sbc to reboot/poweroff ... code in
+        #    ../bin/uCtlr-mon handles that.
+	#
+	if [ -n "$uC_pid" ] ; then
+	    kill -INT $uC_pid
+	    RETVAL=$?
+	fi
+
+	if [ $RETVAL = 0 ]; then
+	    success
+	else
+	    failure
+	fi
+	echo
+       
+	return $RETVAL
+
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	echo -n $"Starting uCtlr-monitor: "
+	success
+	echo
+        ( daemon /etc/init.d/uCtlr-mon DStart &) >/dev/null 2>&1
+#	start
+	;;
+  DStart)
+        start
+        ;;
+  stop)
+	stop
+	;;
+  restart|reload)
+	stop
+	start
+	RETVAL=$?
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $RETVAL

@@ -1,0 +1,38 @@
+<--  { cmd : <cmd>, parameters: [arg1, arg2, ...] }
+
+-->
+{ cmd : <cmd>,
+payload : {
+            status: "error",
+         }
+};
+
+
+
+cmd : cap
+
+response : [ 
+            { cmd : setLedOn,
+              parameters : bool,
+              definition : "Turn on/off LED on 4411 Unit", ... 
+            }
+          ]
+           
+
+radio_info
+    serialnumber
+    pinnumber
+    manufacturer
+    firmwareversion
+    numberofchannels
+    numberoftuners
+    bandwitdh
+
+
+radiostatus
+    state
+    msg
+    pps
+    osc
+    ntp
+

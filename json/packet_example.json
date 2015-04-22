@@ -1,0 +1,23 @@
+{
+    "header": {
+        "action": "getContactList",
+        "status": "ok",
+        "messages": []
+    },
+    "payload": [
+        {
+            "phone": "123.123.1234",
+            "email": "tester1@minecraft.net",
+            "last_login": "03/26/2012, 20:30",
+            "id": 789,
+            "name": "test user 1"
+        },
+        {
+            "phone": "799.654.4567",
+            "email": "tester2@minecraft.net",
+            "last_login": "03/26/2012, 20:30",
+            "id": 654,
+            "name": "test user 2"
+        }
+    ]
+}

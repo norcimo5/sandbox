@@ -1,0 +1,1300 @@
+#!/usr/local/bin/python2.7
+################################################################################
+# Name        : uCtlr.py
+# Description : Python interface to uCtlr
+# Author      : Manuel A. Perez
+#
+################################################################################
+
+################################################################################
+# IMPORTS                                                                      #
+################################################################################
+import subprocess as sub
+import os, sys, socket, time, select, Queue, struct, datetime
+import threading, termios, signal, commands, re, binascii
+import ConfigParser, StringIO
+import json
+
+################################################################################
+# INIT                                                                         #
+################################################################################
+
+DEFAULT_UCTLR_LOG    = '-uCtlr_status.log'
+DEFAULT_BIN_LOG      = '-BinaryDump_uCtlr_status.log'
+DEFAULT_UCTLR_DEVICE = '/dev/ttyUSB3'
+DEFAULT_LOG_DIR      = '/tmp/'
+DEFAULT_NODE_FILE    = '/h/GEOnet/config/node.properties'
+DEFAULT_STARMAN_FILE = '/h/GEOnet/bin/config/tm_starman_data.xml'
+DEFAULT_GEONET_FILE  = '/dev/shm/geonet_status.snl'
+UCTLR_STARTUP_FILE   = '/dev/shm/Starting_uCtlr-mon'
+DEFAULT_DCST_PORT    = '5072'
+DEFAULT_DCST_HOSTNAME= '127.0.0.1'
+DEFAULT_DCST_OUTPUT  = '/tmp/output.txt'
+DEFAULT_GEOVER_FILE  = '/h/GEOnet/config/geonet-ver'
+
+################################################################################
+# CLASS DEFINITIONS                                                            #
+################################################################################
+class dcstcommon:
+    "Isolate socket handling and buffering from the protcol interpretation."
+    def __init__(self, hostname=DEFAULT_DCST_HOSTNAME, port=DEFAULT_DCST_PORT):
+        self.sock = None        # in case we blow up in connect
+        self.linebuffer = ""
+        self.dcstisup   = False
+        self.connect(hostname, port)
+        self.verbose = 0
+
+    def connect(self, hostname, port):
+        """Connect to a host on a given port.
+
+        If the hostname ends with a colon (`:') followed by a number, and
+        there is no port specified, that suffix will be stripped off and the
+        number interpreted as the port number to use.
+        """
+        if not port and (host.find(':') == host.rfind(':')):
+            i = host.rfind(':')
+            if i >= 0:
+                hostname, port = host[:i], host[i+1:]
+            try: port = int(port)
+            except ValueError:
+                raise socket.error, "nonnumeric port"
+
+        #print '[DEBUG] Connect:', (hostname, port)
+        msg = "getaddrinfo returns an empty list"
+        self.sock = None
+        for res in socket.getaddrinfo(hostname, port, 0, socket.SOCK_STREAM):
+            af, socktype, proto, canonname, sa = res
+            try:
+                self.sock = socket.socket(af, socktype, proto)
+                self.sock.connect(sa)
+            except socket.error, msg:
+                self.close()
+                continue
+            break
+        if not self.sock:
+            self.dcstisup = False
+        else:
+            self.dcstisup = True
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+        self.sock = None
+
+    def __del__(self):
+        self.close()
+
+    def isdcstup(self):
+        return self.dcstisup
+
+    def waiting(self):
+        "Return True if data is ready for the client."
+        if self.linebuffer:
+            return True
+        (winput, woutput, wexceptions) = select.select((self.sock,), (), (), 0)
+        return winput != []
+
+    def read(self):
+        "Wait for and read data being streamed from the daemon."
+        if self.verbose > 1:
+            sys.stderr.write("poll: reading from daemon...\n")
+        eol = self.linebuffer.find(';')
+        if eol == -1:
+            frag = self.sock.recv(4096)
+            self.linebuffer += frag
+            if self.verbose > 1:
+                sys.stderr.write("poll: read complete.\n")
+            if not self.linebuffer:
+                if self.verbose > 1:
+                    sys.stderr.write("poll: returning -1.\n")
+                # Read failed
+                return -1
+            eol = self.linebuffer.find(';')
+            if eol == -1:
+                if self.verbose > 1:
+                    sys.stderr.write("poll: returning 0.\n")
+                # Read succeeded, but only got a fragment
+                return 0
+        else:
+            if self.verbose > 1:
+                sys.stderr.write("poll: fetching from buffer.\n")
+
+        # We got a line
+        eol += 1
+        self.response = self.linebuffer[:eol]
+        self.linebuffer = self.linebuffer[eol:]
+
+        # Can happen if daemon terminates while we're reading.
+        if not self.response:
+            return -1
+        if self.verbose:
+            sys.stderr.write("poll: data is %s\n" % repr(self.response))
+        self.received = time.time()
+        # We got a \n-terminated line
+        return len(self.linebuffer)
+
+    def send(self, commands):
+        "Ship commands to the daemon."
+        if not commands.endswith(";"):
+            commands += ";"
+        self.sock.sendall(commands)
+
+class dcst(dcstcommon):
+    
+    def __init__(self, command="", outputfile=DEFAULT_DCST_OUTPUT, host=DEFAULT_DCST_HOSTNAME, port=DEFAULT_DCST_PORT):
+        dcstcommon.__init__(self, host, port)
+        self.command = command
+        self.success = 0
+        self.commandmap = { 'drtinfo'   : '{ "command" : "radioInfo", "parameters" :"" };', \
+                            'drtstatus' : '{ "command" : "radioStatus", "parameters" :"" };' }
+    def exit(self):
+        self.closeall()
+        return self.success      
+
+    def closeall(self):
+        return 
+
+    def reformat(self, data):
+        result = {}
+        j = json.loads(data.rstrip('\n').rstrip(';'))
+
+        if 'command' in j.keys():
+            if   j['command'] == 'isLedOn':
+                for l in j['response']:
+                    for k, v in l.items():
+                        result.update( {j['command'] : v} )
+            elif j['command'] == 'radioInfo':
+                for l in j['response']:
+                    for k, v in l.items():
+                        result.update({ k : v })
+            elif j['command'] == 'radioStatus':
+                for l in j['response']:
+                    for k, v in l.items():
+                        if k == 'lock':
+                            result.update({ (k + "." + "gps") : v['gps'] } )
+                            result.update({ (k + "." + "ntp") : v['ntp'] } )
+                        else:
+                            result.update( {k : v} )
+
+            del j['command']
+
+        return result
+
+    def sendmsg(self, command=""):
+        if not self.dcstisup:
+            try:
+                self.connect(hostname, port)
+                self.dcstup = True
+            except:
+                return None
+            
+        if command != "":
+            self.command = command
+        if self.command in self.commandmap.keys():
+            if self.verbose:
+                print "[DEBUG] Sending: " + self.commandmap[self.command]
+            self.success = self.send(self.commandmap[self.command])
+            if self.read() == -1:
+                self.dcstisup = False
+                return None
+
+        return self.reformat(self.response)
+
+
+#    dcst = dcst()
+#    i = dcst.sendmsg('drtinfo')
+#    s = dcst.sendmsg('drtstatus')
+#
+#    if not i:
+#        print "nothing for i\n"
+#    else:
+#        print i
+#    if not s:
+#        print "nothing for s\n"
+#    else:
+#        print s
+#
+################################################################################
+#                                                                              #
+################################################################################
+class uctlrcommon:
+    "Isolate socket handling and buffering from the protcol interpretation."
+    def __init__(self, device = DEFAULT_UCTLR_DEVICE):
+        self.device = device
+        self.deviceHandler = None
+        self.writeHandler = None
+        self.attach_serial()
+        self.connect()
+        self.verbose = 0
+        self.FlogDCount = 0.0
+
+    def attach_serial(self):
+        try:
+            f = open (self.device, 'rb+')
+
+        except IOError:
+            sys.stderr.write("[ uCtlr ERROR: CANNOT CONNECT TO " + self.device + ".  ]\n")
+            sys.exit(1) 
+
+        f.flush()
+        
+        old = termios.tcgetattr(f)
+        new = termios.tcgetattr(f)
+      
+        new[0] = termios.IGNPAR
+        new[1] = ~termios.OPOST
+        new[2] = termios.CREAD | termios.HUPCL | termios.CLOCAL | termios.CS8 | termios.B115200
+        new[3] = 0
+        new[4] = termios.VMIN & ~termios.VTIME
+
+        termios.tcsetattr(f, termios.TCSANOW, new)
+
+        f.close()
+
+        os.system("/bin/stty --file=%s 115200" % DEFAULT_UCTLR_DEVICE)
+
+        return
+
+    def connect(self):
+        """Connect to a device handler
+        """
+        try:
+            self.deviceHandler = open (self.device, 'rb+')
+            self.writeHandler = open (self.device, 'wb+')
+
+        except IOError:
+            sys.stderr.write("[ uCtlr ERROR: CANNOT CONNECT TO " + self.device + ". EXITING ]\n")
+            sys.exit(1) 
+
+        return self.deviceHandler
+
+    def close(self):
+        if self.deviceHandler:
+            self.deviceHandler.close()
+        self.deviceHandler = None
+
+        if self.writeHandler:
+            self.writeHandler.close()
+        self.writeHandler = None
+
+        return
+
+    def __del__(self):
+        self.close()
+
+    def waiting(self):
+        "Return True if data is ready for the client."
+        select.select([self.deviceHandler], [], [], 30)
+        return
+
+class uCtlr(uctlrcommon):
+    
+    def __init__(self):
+        uctlrcommon.__init__(self)
+        self.FlogDFileHandler  = self.openLogFile()
+        self.binLogFileHandler = self.openBinLogFile()
+        self.success           = 0
+        self.runningFlag       = True
+        self.msgQueue          = Queue.Queue()
+        self.today             = self.getDateStr(simple = True)
+        self.notify_packet     = []
+        self.geoversion        = self.get_geoversion()
+        self.t                 = 0
+        self.dcst              = dcst()
+
+        self.messageMap = {     \
+              1 :self.ackHandler, \
+              2 :self.ackHandler, \
+              3 :self.ackHandler, \
+              4 :self.ackHandler, \
+              5 :self.ackHandler, \
+              6 :self.ackHandler, \
+              7 :self.ackHandler, \
+              8 :self.ackHandler, \
+              9 :self.ackHandler, \
+             10 :self.ackHandler, \
+             11 :self.ackHandler, \
+            100 :self.message100Handler, \
+            101 :self.message101Handler, \
+            102 :self.message102Handler, \
+            103 :self.message103Handler, \
+            104 :self.message104Handler, \
+            105 :self.message105Handler, \
+            106 :self.message106Handler, \
+            107 :self.message107Handler, \
+            108 :self.message108Handler, \
+            109 :self.message109Handler, \
+            110 :self.message110Handler, \
+            111 :self.message111Handler }
+
+    def exit(self):
+        self.FlogD(("Going down ... on SIGINT ... %d\n" % os.getpid()), False)
+        self.runningFlag = False
+        self.FlogD("        . . . . Ending")
+        self.dcst.close()
+        return self.success      
+
+    def closeall(self):
+        self.FlogDFileHandler.flush()
+        self.binLogFileHandler.flush()
+        self.FlogDFileHandler.close()
+        self.binLogFileHandler.close()
+
+    def openLogFile(self):
+        return open(DEFAULT_LOG_DIR + self.getDateStr(simple = True) + DEFAULT_UCTLR_LOG, "a")
+
+    def openBinLogFile(self):
+        return open(DEFAULT_LOG_DIR + self.getDateStr(simple = True) + DEFAULT_BIN_LOG, "ab+")
+
+    def FlogD(self, data, decorate = True):
+        f = self.FlogDFileHandler
+
+        if f is not None and not f.closed:
+            if decorate == True:
+                f.write(self.getDateStr() + " " + data + "\n")
+            else: 
+                f.write(data + "\n")
+
+            f.flush()
+
+            date = self.getDateStr(simple = True)
+            if self.today != date:
+                self.today = date
+                resetLogs()
+
+        return
+
+    def binLog(self, packet):
+        f = self.binLogFileHandler
+        if f is not None and not f.closed:
+            f.write(str(bytearray(packet)))
+            f.flush()
+
+        return
+
+    ################################################################################
+    # UTIL METHODS                                                                 #
+    ################################################################################
+    def crc8(self, packet = [ 0x00 ]):
+        checksum = 0
+        for c in packet:
+            checksum += c
+    
+        return checksum & 0xFF
+    
+    def getNextPacket(self):
+        packet = []
+        f = self.deviceHandler
+        while f is not None and not f.closed:
+            self.waiting()
+            c = f.read(1)
+            if(len(c) > 0 and ord(c) == 0xFF):
+                if(ord(f.read(1)) == 0x81):
+                    messageType = ord(f.read(1))
+                    messageLength = ord(f.read(1))
+                    packet  = [ 0xFF, 0x81, messageType, messageLength ]
+                    packet += [ ord(f.read(1)) for i in range (0, messageLength+1) ]
+                    if ( self.crc8(packet[:-1]) == packet[-1]):
+                        return packet
+    
+        return None
+
+    def sendMessage(self, messagePacket, sendAsync = False):
+        crc = self.crc8(messagePacket)
+        messagePacket.append(crc)
+        msg = str(bytearray(messagePacket))
+        if sendAsync == True:
+            self.msgQueue.put(msg)
+        else:
+            self.writeHandler.write(msg)
+            self.FlogD("Wrote: " + str(messagePacket))
+            self.writeHandler.flush()
+
+        return
+
+    def u162bin(self, number):
+        if number is not None:
+            return [ ord(i) for i in struct.pack(">H", number) ]
+
+    def bin2u16(self, data):
+        if data is not None:
+            return struct.unpack(">H", str(bytearray(data)))[0]
+        else:
+            return None
+
+    def bin2s16(self, data):
+        if data is not None:
+            return struct.unpack(">h", str(bytearray(data)))[0]
+        else:
+            return None
+
+    def s162bin(self, number):
+        if number is not None:
+            return [ ord(i) for i in struct.pack(">h", number) ]
+
+
+    def getDateStr(self, simple = False):
+        if simple:
+            return datetime.datetime.now().strftime('%Y.%m.%d')
+        else:
+            return datetime.datetime.now().strftime('%Y.%m.%d-%H:%M:%S')
+
+    def get_disk_usage(self):
+        df = sub.Popen(["/bin/df", "/"], stdout=sub.PIPE)
+        output = df.communicate()[0]
+        device, size, used, available, percent, mountpoint = output.split("\n")[1].split()
+    
+        p = 0
+        try:
+            p = int(re.findall(r'(\d+)%' , percent)[0])
+        except:
+            pass
+    
+        return p
+
+    def getIP(self, hostname):
+        ip = "0.0.0.0"
+        try:
+            ip = socket.gethostbyname(hostname)
+        except:
+            pass
+
+        return ip
+        
+    def getMyIP(self):
+        ip = "127.0.0.1"
+
+        try:
+            ip = commands.getoutput("/sbin/ifconfig -a").split("\n")[1].split()[1][5:]
+        except:
+            ip = "127.0.0.1"
+
+        return ip
+
+    def get_geoversion(self):
+        geoversion = [ 4, 4, 0 ]
+
+        #print geoversion
+        f = open(DEFAULT_GEOVER_FILE, 'r')
+        verStr = f.readline().rstrip('\n')
+        f.close()
+
+        regex = re.findall(r'^ArthurR(\d*)-(\d*)\.', verStr)[0]
+
+        try:
+            geoversion = [ int(regex[0]), 4, int(regex[1]) ]
+        except:
+            geoversion = [ 4, 4, 26 ]
+
+        #print geoversion
+        return geoversion
+
+    def resetLogs(self):
+        self.closeall()
+        self.FlogDFileHandler  = self.openLogFile()
+        self.binLogFileHandler = self.openBinLogFile()
+  
+        for pattern in (DEFAULT_UCTLR_LOG, DEFAULT_BIN_LOG):
+            for root, dirs, files in os.walk(DEFAULT_TMP_DIR):
+                files = [ f for f in files if f.endswith(pattern) ]
+                files.sort(reverse=True)
+                if len(files) > 5:
+                    for i in range (5, len(files)):
+                        if os.path.isfile(root + files[i]):
+                            os.remove(root + files[i])
+                break 
+        return
+
+    def get_geonetSNL(self):
+        if not os.path.isfile(DEFAULT_GEONET_FILE):
+            self.FlogD( "Warning: geonet_status.snl file not found!")
+            return {}
+    
+        f = open(DEFAULT_GEONET_FILE, 'r')
+        geo = f.readlines()
+        f.close()
+
+        result = {}
+        regex = []
+    
+        for i in geo:
+            regex += re.findall(r'\s*(\w*)="(.*)"', i)
+       
+        for i in regex: 
+            result.update({i[0]:i[1]})
+        
+        geo_str = ''.join(e for e in geo)
+        g = ''.join(geo_str.split())
+        z = re.findall(r'Receivers{Receiver1{Status="(.*)"}Receiver2{Status="(.*)"}}}', g)
+        result.update({'radio1':z[0][0], 'radio2':z[0][1]})
+       
+        gstat = result.get('GateStatus', 'Unknown') 
+        gflag = 0 
+        if gstat == 'Unknown':
+            gflag = 0
+        elif gstat == 'Ready' :    
+            gflag = 1
+        elif gstat == 'Error' :    
+            gflag = 2
+        elif gstat == 'Busy':
+            gflag = 3
+        else:
+            gflag = 0
+
+        result.update({'GateStatus': gflag})
+
+        return result
+
+    def get_starman(self):
+        if not os.path.isfile(DEFAULT_STARMAN_FILE):
+            self.FlogD( "Warning: tm_starman.xml file not found!")
+            return ('Unknown', 0, 0, 0, 0)
+        
+        regex = []
+        gateid = 'Unknown'
+        ipu = [0, 0, 0, 0 ]
+
+        f = open(DEFAULT_STARMAN_FILE, 'r')
+        starman = f.readlines()
+
+        try:
+
+            for i in starman:
+                regex += re.findall(r'\s*<value>(.*)<', i)
+           
+            if regex[0] == 'localhost':
+                gateid = regex[1]
+            else:
+                gateid = regex[0]
+ 
+            ipu = self.parseIP(self.getIP(gateid))
+
+        except:
+            pass
+
+        f.close()
+
+        return (gateid, ipu)
+
+    def get_node_id(self):
+        id = "Unknown"
+        if not os.path.isfile(DEFAULT_NODE_FILE):
+            self.FlogD( "Warning: node.properties file not found!")
+            return id
+
+        ini_str = '[root]\n' + open(DEFAULT_NODE_FILE, 'r').read()
+        ini_fp = StringIO.StringIO(ini_str)
+        config = ConfigParser.RawConfigParser()
+        config.readfp(ini_fp)
+        
+        try:
+            id = config.get('root', 'node.site_id')
+        except:
+            pass
+        
+        return id
+
+    def get_drt_status(self):
+        res = {}
+        drtinfo   = self.dcst.sendmsg('drtinfo')
+        drtstatus = self.dcst.sendmsg('drtstatus')
+        if drtinfo is not None:
+            res.update(drtinfo)
+
+        if drtstatus is not None:
+            res.update(drtstatus)
+
+        return res
+
+    def parseIP(self, ip):
+        if ip.startswith('"') and ip.endswith('"'):
+            ip = ip[1:-1]
+
+        regex = re.findall(r'^(\d*)\.(\d*)\.(\d*)\.(\d*)', ip)
+        return [ int(n) for n in regex[0] ]
+
+    def get_core_temp(self):
+        core0_temp = 0
+        core2_temp = 0
+
+        for root, dirs, files in os.walk("/sys"):
+            for file in files:
+                if file.endswith("temp1_input"):
+                    if root.endswith("coretemp.0"):
+                        with open(os.path.join(root, file), 'r') as f:
+                            core0_temp = int(f.readline()) / 1000
+                    elif root.endswith("coretemp.1"):
+                        with open(os.path.join(root, file), 'r') as f:
+                            core2_temp = int(f.readline()) / 1000
+
+        return ( core0_temp, core2_temp )
+
+    ################################################################################
+    # READ/WRITE SYS METHODS                                                       #
+    ################################################################################
+
+    def updateJavelinHealth(self, packet):
+        #Get core temperatures
+        ( core0_temp, core2_temp ) = self.get_core_temp()
+
+        #Get Version
+        brdNum  = packet[2] * 256 + packet[3]
+        version = ("  %4d PCB Rev.%c   Fmwr: %03d.%02d" % (brdNum, packet[4], packet[0], packet[1]))
+
+        javelinMsg = "#############################################################\n[ " \
+                   + self.getDateStr() + " ]  "  + version + "\n" \
+                   + ("CBR core0 Temperature, \t%d,\t0,\t95\n" % core0_temp) \
+                   + ("CBR core2 Temperature, \t%d,\t0,\t95\n" % core2_temp)
+
+        f = open('/dev/shm/Javelin-health.txt', 'w')
+        f.write(javelinMsg)
+        f.flush()
+        f.close()
+        return
+
+    ################################################################################
+    # MESSAGE SENDING METHODS                                                      #
+    ################################################################################
+
+    def send_message1 (self, sensorName, sensorIpList, nodeErrorBitField, radioState, radioErrorBitField ):
+
+        #print (sensorName, sensorIpList, nodeErrorBitField, radioState, radioErrorBitField)
+        messagePacket = [ 0xFF, 0x81, 0x01, 0x0F ]
+        messagePacket += bytearray(sensorName.ljust(8,' ')[:8])
+        messagePacket += sensorIpList
+        messagePacket += [ nodeErrorBitField, radioState, radioErrorBitField ]
+        self.sendMessage(messagePacket)
+        return
+
+    def send_message2 (self, gateName, gateIpList, gateStatus):
+        #print ( gateName, gateIpList, gateStatus )
+        messagePacket = [ 0xFF, 0x81, 0x02, 0x0F ]
+        messagePacket += bytearray(gateName.ljust(8,' ')[:8])
+        messagePacket += gateIpList 
+        messagePacket.append(0x00)
+        messagePacket += [ gateStatus, 0x00 ]
+        self.sendMessage(messagePacket)
+        return 
+
+    def send_message3 (self, powerCommand, powerItem, powerCycleRestingAmount):
+        messagePacket = [ 0xFF, 0x81, 0x03, 0x03 ]
+        messagePacket += [ powerCommand, powerItem, powerCycleRestingAmount ]
+        self.sendMessage(messagePacket)
+        return 
+
+    def send_message4 (self, powerMode, sleepTime, powerCycleRestingAmount):
+        messagePacket = [ 0xFF, 0x81, 0x04, 0x04 ]
+        messagePacket.append(powerMode)
+        messagePacket += bin2u16(sleepTime)
+        messagePacket.append(powerCycleRestingAmount)
+
+        self.sendMessage(messagePacket)
+        return 
+
+    def send_message5 (self):
+        messagePacket = [ 0xFF, 0x81, 0x05, 0x00 ]
+        self.sendMessage(messagePacket)
+        self.sendMessage(messagePacket)
+        self.sendMessage(messagePacket)
+        return
+
+    def send_message6 (self):
+        messagePacket = [ 0xFF, 0x81, 0x06, 0x00 ]
+        self.sendMessage(messagePacket)
+        self.sendMessage(messagePacket)
+        self.sendMessage(messagePacket)
+        return
+
+    def send_message7 (self, gpsValidFLag, gpsSetting, primaryGPStxSource, secondGPStxSource, iGPSCommand):
+        messagePacket = [ 0xFF, 0x81, 0x07, 0x05 ] + \
+                        [ gpsValidFLag, gpsSetting, primaryGPStxSource, secondGPStxSource, iGPSCommand ]
+
+        self.sendMessage(messagePacket)
+        return 
+    
+    def send_message8 (self, raidStatusByte, raidStatusText):
+        messagePacket = [ 0xFF, 0x81, 0x08, 0x1D ]
+        messagePacket.append(raidStatusByte)
+        messagePacket += bytearray(raidStatusText.ljust(28,' ')[:28])
+        self.sendMessage(messagePacket)
+        return 
+
+    def send_message9 (self, radioType, majorRadioFW, minorRadioFW , radioTemperature, \
+                       majorGEOswVer, midGEOswVer, minorGeoswVer, diskUsed, isNTPLocked, coreTemp):
+        messagePacket = [ 0xFF, 0x81, 0x09, 0x15 ]
+        messagePacket += bytearray(radioType.ljust(10,' ')[:10].encode('ascii'))
+        messagePacket += [ majorRadioFW, minorRadioFW ]
+        messagePacket += self.s162bin(radioTemperature)
+        messagePacket += [majorGEOswVer, midGEOswVer, minorGeoswVer, diskUsed, isNTPLocked, coreTemp, 0x00 ] 
+        self.sendMessage(messagePacket)
+        return 
+
+    def send_message10 (self, validErrorCount, errorMessage1, errorMessage2):
+        messagePacket = [ 0xFF, 0x81, 0x0A, 0x6D ]
+        messagePacket.append(validErrorCount)
+        messagePacket += bytearray(errorMessage1.ljust(54,' ')[:54])
+        messagePacket += bytearray(errorMessage2.ljust(54,' ')[:54])
+        self.sendMessage(messagePacket)
+        return 
+
+    def send_message11 (self, validErrorCount, errorMessage1, errorMessage2):
+        messagePacket = [ 0xFF, 0x81, 0x0B, 0x6D ]
+        messagePacket.append(validErrorCount)
+        messagePacket += bytearray(errorMessage1.ljust(54,' ')[:54])
+        messagePacket += bytearray(errorMessage2.ljust(54,' ')[:54])
+        self.sendMessage(messagePacket)
+        return 
+
+    ################################################################################
+    # MESSAGE HANDLINER METHODS                                                    #
+    ################################################################################
+
+    def message100Handler (self, packet=[]):
+
+        #self.FlogD ("Message 100 - Fan Status: " )
+        #self.FlogD ( str(packet) )
+
+        ##self.FlogD ("  - Fan Power Status             = " + str([ "Dirty", "Internal" ][packet[0] & 1]  + " box fan powered"))
+        #self.FlogD ("  - Dirty Box Fan Intake Tack    = " + str(self.bin2u16(packet[1:3])))
+        #self.FlogD ("  - Dirty Box Fan Exhaust Tack   = " + str(self.bin2u16(packet[3:5])))
+        #self.FlogD ("  - Internal Box Fan Intake Tack = " + str(self.bin2u16(packet[5:7])))
+        #self.FlogD ("  - Internal Box Fan Intake Tack = " + str(self.bin2u16(packet[7:9])))
+        #self.FlogD ("  - Dirty Box Fan Command        = " + str(packet[9]) + "%")
+        #self.FlogD ("  - Internal Box Fan Command     = " + str(packet[10]) + "%")
+        ##self.FlogD ("  - Fan Fault                    = " + str([ "Dirty", "Internal" ][packet[11] & 1] + " box fan is in fault" ))
+        ##self.FlogD ("  - uC Timestamp                 = " + str( 
+
+        return
+
+    def message101Handler (self, packet=[]):
+        #self.FlogD ( "Message 101 - Power (Max) Voltage/Current Maximums: " )
+        #self.FlogD ( str(packet) )
+
+        #self.FlogD ("  - 12V Power Input Voltage    = " + str(self.bin2u16(packet[0:2])/1000.00))
+        #self.FlogD ("  - 24V Power Input Voltage    = " + str(self.bin2u16(packet[2:4])/1000.00))
+        #self.FlogD ("  - MicroController 5V Voltage = " + str(self.bin2u16(packet[4:6])/1000.00))
+        #self.FlogD ("  - 5V Mains Voltage           = " + str(self.bin2u16(packet[6:8])/1000.00))
+        #self.FlogD ("  - 12V Input Current          = " + str(self.bin2u16(packet[8:10])/1000.00))
+        #self.FlogD ("  - 24V Input Current          = " + str(self.bin2u16(packet[10:12])/1000.00))
+        #self.FlogD ("  - 12V SBC Current            = " + str(self.bin2u16(packet[12:14])/1000.00))
+        #self.FlogD ("  - 5V Mains Current           = " + str(self.bin2u16(packet[14:16])/1000.00))
+        #self.FlogD ("  - 5V SSD Voltage             = " + str(self.bin2u16(packet[16:18])/1000.00))
+        #self.FlogD ("  - 5V USB Voltage             = " + str(self.bin2u16(packet[18:20])/1000.00))
+        #self.FlogD ("  - 3.3V Voltage               = " + str(self.bin2u16(packet[20:22])/1000.00))
+        #self.FlogD ("  - GBE2 3.3V Voltage          = " + str(self.bin2u16(packet[22:24])/1000.00))
+        #self.FlogD ("  - Oscillator 2.5V Voltage    = " + str(self.bin2u16(packet[24:26])/1000.00))
+        ##self.FlogD ("  - uC Timestamp (Seconds)     = " + str(self.bin2u16(packet[26:28])))
+
+        return
+
+    def message102Handler (self, packet=[]):
+        #self.FlogD ( "Message 102 - Power (Most Recdent Value): " )
+        #self.FlogD ( str(packet) )
+
+        #self.FlogD ("  - 12V Power Input Voltage    = " + str(self.bin2u16(packet[0:2])/1000.00))
+        #self.FlogD ("  - 24V Power Input Voltage    = " + str(self.bin2u16(packet[2:4])/1000.00))
+        #self.FlogD ("  - MicroController 5V Voltage = " + str(self.bin2u16(packet[4:6])/1000.00))
+        #self.FlogD ("  - 5V Mains Voltage           = " + str(self.bin2u16(packet[6:8])/1000.00))
+        #self.FlogD ("  - 12V Input Current          = " + str(self.bin2u16(packet[8:10])/1000.00))
+        #self.FlogD ("  - 24V Input Current          = " + str(self.bin2u16(packet[10:12])/1000.00))
+        #self.FlogD ("  - 12V SBC Current            = " + str(self.bin2u16(packet[12:14])/1000.00))
+        #self.FlogD ("  - 5V Mains Current           = " + str(self.bin2u16(packet[14:16])/1000.00))
+        #self.FlogD ("  - 5V SSD Voltage             = " + str(self.bin2u16(packet[16:18])/1000.00))
+        #self.FlogD ("  - 5V USB Voltage             = " + str(self.bin2u16(packet[18:20])/1000.00))
+        #self.FlogD ("  - 3.3V Voltage               = " + str(self.bin2u16(packet[20:22])/1000.00))
+        #self.FlogD ("  - GBE2 3.3V Voltage          = " + str(self.bin2u16(packet[22:24])/1000.00))
+        #self.FlogD ("  - Oscillator 2.5V Voltage    = " + str(self.bin2u16(packet[24:26])/1000.00))
+        ##self.FlogD ("  - uC Timestamp (Seconds)     = " + str(self.bin2u16(packet[26:28])))
+
+        return
+
+    def message103Handler (self, packet=[]):
+        #self.FlogD ( "Message 103 - Voltage/Current Minimums: " )
+        #self.FlogD ( str(packet) )
+
+        #self.FlogD ("  - 12V Power Input Voltage    = " + str(self.bin2u16(packet[0:2])/1000.00))
+        #self.FlogD ("  - 24V Power Input Voltage    = " + str(self.bin2u16(packet[2:4])/1000.00))
+        #self.FlogD ("  - MicroController 5V Voltage = " + str(self.bin2u16(packet[4:6])/1000.00))
+        #self.FlogD ("  - 5V Mains Voltage           = " + str(self.bin2u16(packet[6:8])/1000.00))
+        #self.FlogD ("  - 12V Input Current          = " + str(self.bin2u16(packet[8:10])/1000.00))
+        #self.FlogD ("  - 24V Input Current          = " + str(self.bin2u16(packet[10:12])/1000.00))
+        #self.FlogD ("  - 12V SBC Current            = " + str(self.bin2u16(packet[12:14])/1000.00))
+        #self.FlogD ("  - 5V Mains Current           = " + str(self.bin2u16(packet[14:16])/1000.00))
+        #self.FlogD ("  - 5V SSD Voltage             = " + str(self.bin2u16(packet[16:18])/1000.00))
+        #self.FlogD ("  - 5V USB Voltage             = " + str(self.bin2u16(packet[18:20])/1000.00))
+        #self.FlogD ("  - 3.3V Voltage               = " + str(self.bin2u16(packet[20:22])/1000.00))
+        #self.FlogD ("  - GBE2 3.3V Voltage          = " + str(self.bin2u16(packet[22:24])/1000.00))
+        #self.FlogD ("  - Oscillator 2.5V Voltage    = " + str(self.bin2u16(packet[24:26])/1000.00))
+        ##self.FlogD ("  - uC Timestamp (Seconds)     = " + str(self.bin2u16(packet[26:28])))
+
+        return
+
+    def message104Handler (self, packet=[]):
+        #self.FlogD ( "Message 104 - Temperature (Maximum Values): " )
+        #self.FlogD ( str(packet) )
+
+        #self.FlogD ("  - External GPS               = " + str(self.bin2s16(packet[0:2])/100.00))
+        #self.FlogD ("  - AC/DC Converter            = " + str(self.bin2s16(packet[2:4])/100.00))
+        #self.FlogD ("  - DC/DC Converter            = " + str(self.bin2s16(packet[4:6])/100.00))
+        #self.FlogD ("  - Dirty Box Air              = " + str(self.bin2s16(packet[6:8])/100.00))
+        #self.FlogD ("  - Picoceptor                 = " + str(self.bin2s16(packet[8:10])/100.00))
+        #self.FlogD ("  - Internal GPS               = " + str(self.bin2s16(packet[10:12])/100.00))
+        #self.FlogD ("  - SBC Heat Plate             = " + str(self.bin2s16(packet[12:14])/100.00))
+        #self.FlogD ("  - SBC Processor              = " + str(self.bin2s16(packet[14:16])/100.00))
+        #self.FlogD ("  - Internal Air               = " + str(self.bin2s16(packet[16:18])/100.00))
+        ##self.FlogD ("  - uC Timestamp (Seconds)     = " + str(self.bin2u16(packet[26:28])))
+
+        return
+
+    def message105Handler (self, packet=[]):
+        #self.FlogD ( "Message 105 - Temperature (Most Recent Values): " )
+        #self.FlogD ( str(packet) )
+
+        #self.FlogD ("  - External GPS               = " + str(self.bin2s16(packet[0:2])/100.00))
+        #self.FlogD ("  - AC/DC Converter            = " + str(self.bin2s16(packet[2:4])/100.00))
+        #self.FlogD ("  - DC/DC Converter            = " + str(self.bin2s16(packet[4:6])/100.00))
+        #self.FlogD ("  - Dirty Box Air              = " + str(self.bin2s16(packet[6:8])/100.00))
+        #self.FlogD ("  - Picoceptor                 = " + str(self.bin2s16(packet[8:10])/100.00))
+        #self.FlogD ("  - Internal GPS               = " + str(self.bin2s16(packet[10:12])/100.00))
+        #self.FlogD ("  - SBC Heat Plate             = " + str(self.bin2s16(packet[12:14])/100.00))
+        #self.FlogD ("  - SBC Processor              = " + str(self.bin2s16(packet[14:16])/100.00))
+        #self.FlogD ("  - Internal Air               = " + str(self.bin2s16(packet[16:18])/100.00))
+        ##self.FlogD ("  - uC Timestamp (Seconds)     = " + str(self.bin2u16(packet[26:28])))
+
+        return
+
+    def message106Handler (self, packet=[]):
+        #self.FlogD ( "Message 106 - Temperature (Minimum Value): " )
+        #self.FlogD ( str(packet) )
+
+        #self.FlogD ("  - External GPS               = " + str(self.bin2s16(packet[0:2])/100.00))
+        #self.FlogD ("  - AC/DC Converter            = " + str(self.bin2s16(packet[2:4])/100.00))
+        #self.FlogD ("  - DC/DC Converter            = " + str(self.bin2s16(packet[4:6])/100.00))
+        #self.FlogD ("  - Dirty Box Air              = " + str(self.bin2s16(packet[6:8])/100.00))
+        #self.FlogD ("  - Picoceptor                 = " + str(self.bin2s16(packet[8:10])/100.00))
+        #self.FlogD ("  - Internal GPS               = " + str(self.bin2s16(packet[10:12])/100.00))
+        #self.FlogD ("  - SBC Heat Plate             = " + str(self.bin2s16(packet[12:14])/100.00))
+        #self.FlogD ("  - SBC Processor              = " + str(self.bin2s16(packet[14:16])/100.00))
+        #self.FlogD ("  - Internal Air               = " + str(self.bin2s16(packet[16:18])/100.00))
+        #self.FlogD ("  - uC Timestamp (Seconds)     = " + str(self.bin2u16(packet[26:28])))
+
+        return
+
+    def message107Handler (self, packet=[]):
+        #self.FlogD ( "Message 107 - uC Status: " )
+        #self.FlogD ( str(packet) )
+
+        return
+
+    def message108Handler (self, packet=[]):
+        #self.FlogD ( "Message 108 - uC Error Status: " )
+        #self.FlogD ( str(packet) )
+
+        return
+
+    def message109Handler (self, packet=[]):
+        #self.FlogD ( "Message 109 - Version Info: " )
+        #self.FlogD ( str(packet) )
+        self.updateJavelinHealth(packet)
+
+        return
+
+    def message110Handler (self, packet=[]):
+        #self.FlogD ( "Message 110 - uC Command: " )
+        #self.FlogD ( str(packet) )
+
+        uCcommand = packet[0]
+
+        if uCcommand >= 0 and uCcommand <= 5:
+            self.FlogD ( ['Reboot SBC', 'Reboot Entire System', 'Shutdown SBC', \
+                'Shutdown Entire System', 'Reboot Picoceptor', 'Reboot GPS'][uCcommand] )
+
+            self.ack( 110 )
+            self.doShutdown(uCcommand)
+
+        return
+
+    def message111Handler (self, packet=[]):
+        #self.FlogD ( "Message 111 - uC Error Status: " )
+        #self.FlogD ( str(packet) )
+
+        return
+
+    def ackHandler(self, packet):
+        # Do nothing for now
+        return
+
+    def handleMessage(self, packet):
+        id = packet[2]
+        dataLength = packet[3]
+        if not (packet is None) and packet[2] in self.messageMap:
+            self.binLog(packet)
+            self.messageMap[id](packet[4:dataLength+4]) 
+
+        return
+
+    def isRunning(self):
+        return self.runningFlag
+
+    def ack(self, id):
+        messagePacket = [ 0xFF, 0x81, id, 0x00 ] 
+        self.sendMessage(messagePacket)
+        return
+
+    def prep_notify_packet(self, powerCommand, powerItem, powerCycleRestingAmount):
+        self.notify_packet  = [ 0xFF, 0x81, 0x03, 0x03 ]
+        self.notify_packet += [ powerCommand, powerItem, powerCycleRestingAmount ]
+        return
+
+    def doShutdown(self, uCcommand):
+        #TODO: ADD FlogD entry stating power off or powercycle 
+        #     Also, clean up comment mess here
+        if uCcommand == 0:
+            # Reboot SBC
+            self.prep_notify_packet(2, 4, 5)
+            os.system("/sbin/telinit 6")
+        elif uCcommand == 1:
+            # Reboot Entire System
+            self.prep_notify_packet(2, 5, 5)
+            os.system("/sbin/telinit 6")
+        elif uCcommand == 2:
+            # Shutdown SBC
+            self.prep_notify_packet(0, 4, 0)
+            os.system("/sbin/telinit 0")
+        elif uCcommand == 3:
+            # Shutdown Entire System
+            self.prep_notify_packet(0, 5, 0)
+            os.system("/sbin/telinit 0")
+        elif uCcommand == 4:
+            # Reboot Picoceptor
+            self.send_message3(2, 3, 0)
+        elif uCcommand == 5:
+            # Reboot GPS
+            self.send_message3(2, 1, 5)
+            self.send_message3(2, 2, 5)
+        else:
+            self.FlogD("Error: Invalid Shutdown uCcommand --> " + str(uCcommand))
+        
+        return
+
+    def get_sensorStatus(self):
+        sensorName   = self.get_node_id()
+        sensorIpList = self.parseIP(self.getMyIP())
+        nodeErrorBitField  = 0
+        ntpFlag            = 1
+        gpsFlag            = 2
+
+        d = self.get_geonetSNL()
+
+        node = d.get('LocalNodeStatus', 'Unknown')
+
+        if node == 'Ready':
+            nodeErrorBitField  = 0
+
+        drt = self.get_drt_status()
+
+        if drt.get('lock.ntp', 'false') == 'true':
+            ntpFlag = 0
+
+        if drt.get('lock.gps', 'false') == 'true':
+            gpsFlag = 0
+        
+        nodeErrorBitField = nodeErrorBitField | ntpFlag | gpsFlag
+
+        radio = d.get('Radio1', 'Unknown')
+        radioState = 0
+        if radio == 'Unknown':
+            radioState = 0
+        elif radio == 'Ready':
+            radiostate = 1
+        elif radio == 'Offline':
+            radioState = 2
+        else:
+            radioState = 3
+
+        #TODO: POPULATE THIS AFTER GETTING DRT STATUS FROM DCST QUERY
+        radioErrorBitField = 0
+
+        return (sensorName, sensorIpList, nodeErrorBitField, radioState, radioErrorBitField)
+
+    def get_gateStatus(self):
+        # Read geo
+        d = self.get_geonetSNL()
+       
+        gateStatus    = d.get('GateStatus', 0)
+        gateName      = d.get('GateID', 'Unknown')
+        gateIpList    = self.parseIP(d.get('GateIPAddress', '0.0.0.0'))
+
+        #TODO: FIX STARMAN DEFAULTS
+        #If gate id = unknown then read starman
+        if gateName == 'Unknown':
+            gateStatus = 0
+        #    (gateName, gateIpList) = self.get_starman()
+
+        return (gateName, gateIpList, gateStatus)
+
+    def get_raidStatus(self):
+        msgStr = "RAID1 : Unknown state."
+        status = 0
+       
+        try: 
+            md0 = sub.check_output(["/sbin/mdadm", "--detail", "/dev/md0"], stdout=sub.PIPE, stderr=sub.PIPE)
+        except:
+            return ( status, msgStr )
+
+        aActive      = int(re.findall(r'Active.*: (\d*)', md0)[0])
+        aWorking     = int(re.findall(r'Working.*: (\d*)', md0)[0])
+        aRaidDevices = int(re.findall(r'Raid Devices.*: (\d*)', md0)[0])
+        aSize        = float(re.findall(r'Array Size.*: (\d*)', md0)[0])
+        aDegraded    = aActive < aRaidDevices
+
+        try: 
+            md1 = sub.check_output(["/sbin/mdadm", "--detail", "/dev/md1"], stdout=sub.PIPE, stderr=sub.PIPE)
+        except:
+            return ( status, msgStr )
+
+        bActive      = int(re.findall(r'Active.*: (\d*)', md1)[0])
+        bWorking     = int(re.findall(r'Working.*: (\d*)', md1)[0])
+        bRaidDevices = int(re.findall(r'Raid Devices.*: (\d*)', md1)[0])
+        bSize        = float(re.findall(r'Array Size.*: (\d*)', md1)[0])
+        bDegraded    = bActive < bRaidDevices
+        
+        tSize = aSize + bSize
+        rebuiltSize = 0
+        rSize = 0
+        aRebuilding = False
+        bRebuilding = False
+        
+        msgStr = "RAID1 : Unknown state."
+        status = 0
+        
+        if( ( aWorking != 2 ) and ( bWorking != 2 ) ):
+            msgStr = "RAID1 :  Mirror offline"
+            status = 0
+        else:
+            aState   = re.findall(r'State.*: (\w*)', md0)[0]
+            bState   = re.findall(r'State.*: (\w*)', md1)[0]
+        
+            if aState == 'resyncing' or aState == 'recovering':
+                aRebuilding = True
+        
+            if bState == 'resyncing' or bState == 'recovering':
+                bRebuilding = True
+        
+            Rebuilding  = ( aRebuilding ) or ( bRebuilding )
+        
+            if not Rebuilding:
+                if( ( aActive == 2) and ( bActive == 2 ) ):
+                    msgStr = "RAID1 :  Operational"
+                    status = 1
+                else:
+                    pass
+        
+            else:
+                if aRebuilding:
+                    a = int(re.findall(r'Rebuild Status.*: (\d*)', md0)[0])
+                    aCpc  = a/100
+                    rSize = aCpc * aSize
+                elif not aDegraded:
+                    rebuiltSize += aSize
+        
+                if bRebuilding:
+                    b = int(re.findall(r'Rebuild Status.*: (\d*)', md1)[0])
+                    bCpc  = b/100
+                    rSize = bCpc * aSize
+        
+                elif not bDegraded:
+                    rebuiltSize += bSize
+        
+                pComplete = ((rSize + rebuiltSize) / tSize) * 100
+                msgStr    = "RAID1 :  Rebuilding " + str(pComplete*100)
+                status    = 3
+       
+        return ( status, msgStr )
+    
+    def get_sensor_info(self):
+        # TODO: FIX THIS FUNCTION
+        #defaults
+        radioType        = "Unknown"
+        majorRadioFW     = 0
+        minorRadioFW     = 0
+        radioTemperature = 0
+        majorGEOswVer    = 4
+        midGEOswVer      = 4
+        minorGeoswVer    = 0
+        diskUsed         = self.get_disk_usage()
+        isNTPLocked      = 0 
+        coreTemp         = max(self.get_core_temp())
+
+        regex = []  
+        drt = self.get_drt_status()
+       
+        radioType   = drt.get('modelNumber', 'UNKNOWN')
+        firmwareStr = drt.get('firmwareVersion', '00.00.00-|00')
+        regex       = re.findall(r'^(\d*)\.(\d*)', firmwareStr)[0]
+       
+        try:
+            majorRadioFW = int(regex[0])
+            minorRadioFW = int(regex[1])
+        except:
+            pass
+
+        radioTempStr = drt.get('temperature', 'nan')
+        if radioTempStr == 'nan':
+            radioTemperature = 0
+        
+        else:
+            radioTemperature = int(radioTempStr) * 100
+
+        geo = self.geoversion
+
+        majorGEOswVer    = geo[0]
+        midGEOswVer      = 4
+        minorGeoswVer    = geo[2]
+
+        if drt.get('lock.ntp', 'false') == 'true':
+            isNTPLocked = 1
+
+        return ( radioType, majorRadioFW, minorRadioFW , radioTemperature, majorGEOswVer, midGEOswVer, minorGeoswVer, diskUsed, isNTPLocked, coreTemp ) 
+
+    def do_status(self):
+
+        # Sensor Information
+        #self.sendMessage([0xFF, 0x81, 0x01, 0x0F, 117, 110, 107, 110, 111, 119, 110, 32, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00])
+        (sensorName, sensorIpList, nodeErrorBitField, radioState, radioErrorBitField) = self.get_sensorStatus()
+        self.send_message1 (sensorName, sensorIpList, nodeErrorBitField, radioState, radioErrorBitField )
+
+        # Gate Information
+        #self.sendMessage([0xFF, 0x81, 0x02, 0x0F, 117, 110, 107, 110, 111, 119, 110, 32, 0x00, 0x00,0x00,0x00,0x00, 0x00, 0x00])
+        (gateName, gateIpList, gateStatus) = self.get_gateStatus()
+        self.send_message2 (gateName, gateIpList, gateStatus)
+
+        # RAID Status
+        ( raidStatusByte, raidStatusText) = self.get_raidStatus()
+        self.send_message8 (raidStatusByte, raidStatusText)
+       
+        (radioType, majorRadioFW, minorRadioFW , radioTemperature, majorGEOswVer, midGEOswVer, minorGeoswVer, diskUsed, isNTPLocked, coreTemp) = self.get_sensor_info() 
+        self.send_message9 (radioType, majorRadioFW, minorRadioFW , radioTemperature, majorGEOswVer, midGEOswVer, minorGeoswVer, diskUsed, isNTPLocked, coreTemp)
+
+        #TODO: Message 10 and 11 stubs for testing
+        validErrorCount = 2
+        errorMessage1 = "ERROR MESSAGE 1"
+        errorMessage2 = "ERROR MESSAGE 2"
+        self.send_message10 (validErrorCount, errorMessage1, errorMessage2)
+        self.send_message11 (validErrorCount, errorMessage1, errorMessage2)
+
+        return
+
+    def mainLoop(self):
+        packet = []
+        f = self.writeHandler
+        self.FlogD("        . . . . Monitoring Started.")
+
+        while self.isRunning():
+            start_time = time.time()
+            elapsed_time = 0
+
+            # READ packets from uCtlr
+            while self.isRunning() and not elapsed_time > 2:
+                packet = self.getNextPacket()
+                self.handleMessage(packet)
+                elapsed_time = time.time() - start_time
+                time.sleep(0.05)
+
+            # Do status messages
+            self.do_status()
+            
+            # WRITE queued packets to uCtlr
+            while not self.msgQueue.empty():
+                msg = self.msgQueue.get()
+                f.write(msg)
+                f.flush()
+                self.msgQueue.task_done()
+
+        self.exit()
+        return
+
+    def stop(self, notify = False):
+        if notify == True:
+            time.sleep(4)
+            self.FlogD("Going down ... on SIGTERM ... notify sent to uCtlr.")
+            if self.notify_packet:
+                self.sendMessage(self.notify_packet)
+
+        self.runningFlag = False
+        return
+
+    def start(self):
+        self.FlogD("        . . . . Starting")
+        self.FlogD("#  Cpu: temperature file:: < /sys/devices/platform/coretemp.0/temp1_input >", False)
+        self.FlogD("#  Cpu: temperature file:: < /sys/devices/platform/coretemp.2/temp1_input >", False)
+        self.FlogD("#  uCtlr->get_serial_port():: </dev/ttyUSB3>", False)
+        self.FlogD("#  Initial serial line:: </dev/ttyUSB3>", False)
+        self.FlogD("        . . . . Setting up serial port ...")
+
+        # Verify that script is being run as root
+        if os.geteuid() != 0:
+            self.FlogD("#  Error: You need to have root privileges to run this script.", False)
+            self.FlogD("#  Error: Please try again, this time using sudo. Exiting.    ", False)
+            self.closeall()
+            self.runningFlag = False
+            return threading.currentThread()
+
+        # Inform start/stop script that all is well
+        self.FlogD("        . . . . Serial comms online.")
+        if os.path.isfile(UCTLR_STARTUP_FILE):
+            os.unlink(UCTLR_STARTUP_FILE)        
+
+        self.t = threading.Thread(target=self.mainLoop)
+        self.t.setDaemon(False)
+        self.t.start()
+
+        return self.t
+
+################################################################################
+# SIGINT HANDLER CODE                                                          #
+################################################################################
+stopflag     = False
+notify_uCtlr = False
+
+def mon_sig_handler(signum, frame):
+    if signum == signal.SIGINT:
+        global stopflag
+        stopflag = True
+    elif signum == signal.SIGTERM:
+        global notify_uCtlr
+        notify_uCtlr = True
+
+    return
+
+################################################################################
+# MAIN 
+################################################################################
+# TODO: ADD ARGUEMENT HANDLING CODE HERE
+
+if __name__ == '__main__':
+
+    #Start session      
+    session = uCtlr()
+    t = session.start()
+    
+    signal.signal(signal.SIGINT, mon_sig_handler)
+    signal.signal(signal.SIGTERM, mon_sig_handler)
+
+    while session.isRunning():
+        if stopflag == True :
+            session.stop()
+        elif notify_uCtlr == True :
+            session.stop(notify = True)
+        time.sleep(1)
+
+    try:
+        t.join()
+    except:
+        pass
+
+    sys.exit(0)
+
+################################################################################
+# EOF                                                                          #
+################################################################################

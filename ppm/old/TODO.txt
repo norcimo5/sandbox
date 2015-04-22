@@ -1,0 +1,2 @@
+-> Read, manipulate, then write ppm files
+-> Manipulate GIF, PNG, JPG files

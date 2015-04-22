@@ -1,0 +1,7 @@
+Put all useful functions in a utils.c/utils.h
+
+Add code to read the exe file (done)
+Add code to write the exe file back to disk (pending)
+Add code to access the buffered data from structures (similar to windows)
+
+-> Another option is to copy win32 api functionality for just those functions I'm missing and re-use the code

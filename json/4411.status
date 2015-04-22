@@ -1,0 +1,21 @@
+System Status:
+installedSoftwareVersion=02.06.00-|B8
+systemSerialNumber=407
+systemType=9eb11226-d1aa-4f3a-9db7-78d9f28dd426
+systemTypeDescription=drt4411b
+temperatureOk=true
+selfTestOk=true
+voltageOk=true
+
+Reference Status Update:
+clockReferenceLocked=false
+input10MHzPresent=true
+input1PPSPresent=true
+
+Front Panel LED Status Update:
+LedOn=true
+
+NTP Status Update:
+ntpServerIpAddress=192.168.43.100
+serverReachable=true
+ntpServiceReachable=true

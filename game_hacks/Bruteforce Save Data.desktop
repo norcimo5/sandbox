@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Bruteforce Save Data
+Exec=env WINEPREFIX="/home/norcimo5/.wine" wine C:\\\\Program\\ Files\\ \\(x86\\)\\\\Bruteforce\\ Save\\ Data\\\\BruteforceSaveData.exe 
+Type=Application
+StartupNotify=true
+Path=/home/norcimo5/.wine/dosdevices/c:/windows/system32
+Icon=F38E_BruteforceSaveData.0

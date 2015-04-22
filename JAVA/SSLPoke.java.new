@@ -1,0 +1,55 @@
+import java.io.InputStream;
+import java.io.OutputStream;
+
+import java.security.cert.X509Certificate;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+ 
+/** Establish a SSL connection to a host and port, writes a byte and
+  * prints the response. See
+  * http://confluence.atlassian.com/display/JIRA/Connecting+to+SSL+services
+  */
+public class SSLPoke {
+  public static void main(String[] args) {
+    if (args.length != 2) {
+      System.out.println("Usage: "+SSLPoke.class.getName()+" <host> <port>");
+      System.exit(1);
+    }
+                          // Create a trust manager that does not validate certificate
+                          // chains
+  // Create a trust manager that does not validate certificate chains
+      TrustManager[] trustAllCerts = new TrustManager[] { 
+            new X509TrustManager() {
+                    public X509Certificate[] getAcceptedIssuers() { 
+                              return new X509Certificate[0]; 
+                                    }
+                          public void checkClientTrusted(X509Certificate[] certs, String authType) {}
+                                public void checkServerTrusted(X509Certificate[] certs, String authType) {}
+                                  }};
+                                    // Install the all-trusting trust manager
+                                    // try { } catch (GeneralSecurityException e) {
+                                    // }
+    try {
+                                    SSLContext sc = SSLContext.getInstance("SSL");
+                                    sc.init(null, trustAllCerts, new java.security.SecureRandom());
+                                    SSLSocketFactory sslsocketfactory = sc.getSocketFactory();
+                                    SSLSocket sslsocket = (SSLSocket) sslsocketfactory.createSocket(args[0], Integer.parseInt(args[1]));
+      InputStream in = sslsocket.getInputStream();
+      OutputStream out = sslsocket.getOutputStream();
+       
+      // Write a test byte to get a reaction :)
+      out.write(1);
+       
+      while (in.available() > 0) {
+        System.out.print(in.read());
+      }
+      System.out.println("Successfully connected");
+       
+    } catch (Exception exception) {
+      exception.printStackTrace();
+    }
+  }
+}

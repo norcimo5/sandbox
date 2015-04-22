@@ -1,0 +1,409 @@
+#! /bin/bash
+
+#
+# Classification: UNCLASS
+#
+###############################################################################
+
+. $(/usr/bin/dirname $0)/root-trap.bash
+
+###############################################################################
+#
+# startup shenanigans
+#
+export PATH=${bindir}:${bindir}/tools:/bin:/usr/bin:/sbin:/usr/sbin:$PATH
+
+ostype=`uname -s`
+bindir=`dirname $0`
+cd $bindir/.
+bindir=`/bin/pwd`
+
+###############################################################################
+
+
+
+#
+# Bug 3580. for development purposes, turn on core dumps
+#
+if [ "$ostype" = "Linux" ]; then
+
+    ulimit -c unlimited
+
+    #
+    # it would probably be good to add the following line to the
+    # /etc/sysctl.conf file:
+    #
+    # kernel.core_pattern = core_%e_%p
+    #
+
+fi
+
+
+
+# Bug 5278
+umask 2
+
+topdir=$bindir/../.
+libdir=$topdir/lib/.
+toolsdir=$bindir/tools/.
+
+LD_LIBRARY_PATH=${libdir}:/usr/local/lib:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH
+
+if [ "$ostype" = "SunOS" ]
+then
+  coreadm -p core.%f%p $$
+fi
+
+
+nodeType_prefix=$'\x68\x69\x74\x73'
+
+
+# defaults
+
+if [ -f $bindir/get-property.bash ]; then
+    . $bindir/get-property.bash 
+else
+    echo "unable to include \"$bindir/get-property.bash\". Cannot continue."
+    exit 1
+fi
+
+
+#
+# pre_tm_startups is a BASH array that contains a list of commands to
+# be started (in the background) before the TM is started. Use the
+# convenience shell function add_pre_tm_startup to add commands to
+# this list. It's probably wise to put the arguments to this function
+# inside quotes.
+#
+declare -a pre_tm_startups
+add_pre_tm_startup () { 
+    while [ -n "$1" ]; do
+	pre_tm_startups[${#pre_tm_startups[@]}]="$1"
+	shift
+    done
+}
+
+
+
+function copy_old_log_files
+{
+  filename=$1
+  max=$2
+  count=$max
+
+  while [ $count -gt 0 ]
+  do
+    if [ -f $filename.bak.$count ]
+    then
+      mv $filename.bak.$count $filename.bak.`expr $count + 1`
+    fi
+
+    count=`expr $count - 1`
+  done
+
+  mv $filename $filename.bak.1
+}
+
+
+# always start a local logger before starting 
+add_pre_tm_startup 'slogd -U'
+
+
+propfile=$topdir/config/node.properties
+hostmap_file=$topdir/config/hostmap.properties
+
+GEONET_SITE_ID="$(get_property $propfile node.site_id)"
+GEONET_TM_NODE="$(get_property $hostmap_file sl-host)"
+
+collector_type="$(get_property $propfile node.collection_system)"
+case "$collector_type" in
+    v3)                    
+	GEONET_TYPE=${nodeType_prefix}_dcs_cal 
+	add_pre_tm_startup 'slogd -I'
+	add_pre_tm_startup 'sdr'
+	;;
+
+    dfly*) 
+	GEONET_TYPE=${nodeType_prefix}_dcs_cal 
+	add_pre_tm_startup 'slogd -I'
+    add_pre_tm_startup 'sdr'
+	;;
+	
+    drt)                    
+	GEONET_TYPE=${nodeType_prefix}_dcs_cal 
+	add_pre_tm_startup 'slogd -I'
+	add_pre_tm_startup 'sdr'
+	add_pre_tm_startup 'run_dcst'
+	add_pre_tm_startup 'cal'
+	;;
+
+    ffly) 
+	GEONET_TYPE=${nodeType_prefix}_dcs_cal 
+	add_pre_tm_startup 'slogd -I'
+	add_pre_tm_startup 'sdr'
+	add_pre_tm_startup 'run_dcs'
+	add_pre_tm_startup 'cal'
+	;;
+
+    *)
+	GEONET_TYPE= ;;
+
+esac
+
+#
+# process command line arguments
+#
+Usage () {
+    cat <<EOF
+
+Usage: $(basename $0) [ -c geonet_type ] [ -i site_id ] [ -S mysql_socket_path ]
+
+EOF
+
+    exit
+}
+
+
+while getopts hc:i:S: flag
+  do
+  case $flag in
+      c)  GEONET_TYPE="$OPTARG" ;;
+      i)  GEONET_SITE_ID="$OPTARG" ;;
+      S)  export GEONET_MYSQL_SOCKET_PATH="$OPTARG" ;;
+      h)  Usage ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+
+if [ -z "$GEONET_TYPE" ]; then
+    echo 'GEONET_TYPE (-c) not set'
+    echo "can't continue"
+    exit 1
+fi
+
+
+if [ -z "$GEONET_SITE_ID" ]; then
+    echo 'GEONET_SITE_ID (-i) not set'
+    echo "can't continue"
+    exit 1
+fi
+
+[ -z "$GEONET_SCRATCH_BASE" ] && GEONET_SCRATCH_BASE=/GEOnet
+export GEONET_SCRATCH_BASE
+
+if [ -z "$GEONET_DATA" ]; then
+    GEONET_DATA=$GEONET_SCRATCH_BASE/$GEONET_SITE_ID
+fi
+/bin/mkdir -p $GEONET_DATA >/dev/null 2>&1
+if [ -d $GEONET_DATA ]; then
+    :
+else
+    echo "the GEONET_DATA dir ($GEONET_DATA) does not exist."
+    echo "cannot continue."
+    exit 1
+fi
+
+
+if [ -z "$GEONET_COMMON" ]; then 
+    GEONET_COMMON=$GEONET_DATA
+fi
+if [ -d $GEONET_COMMON ]; then
+    :
+else
+    echo "the GEONET_COMMON dir ($GEONET_COMMON) does not exist."
+    echo "cannot continue."
+    exit 1
+fi
+
+
+[ -z "$GEONET_LOG_DIR" ] && GEONET_LOG_DIR=$GEONET_DATA/log
+
+/bin/mkdir -p $GEONET_LOG_DIR >/dev/null 2>&1
+if [ -d $GEONET_LOG_DIR ]; then
+    :
+else
+    echo "cannot create the GEONET_LOG_DIR ($GEONET_LOG_DIR)."
+    echo "cannot continue."
+    exit 1
+fi
+
+
+# check to see if the log file can be written to, if not then bail
+/bin/rm -f $GEONET_LOG_DIR/._.Check
+touch $GEONET_LOG_DIR/._.Check 2>/dev/null || {
+    echo "Unable to write to GEOnet log directory \"$GEONET_LOG_DIR\""
+    echo "Cannot continue."
+    exit 1
+}
+/bin/rm -f $GEONET_LOG_DIR/._.Check
+
+
+GEONET_SCRATCH_DIR=$GEONET_DATA/runtime
+/bin/mkdir -p $GEONET_SCRATCH_DIR >/dev/null 2>&1
+if [ -d $GEONET_SCRATCH_DIR ]; then
+    :
+else
+    echo "cannot create the GEONET_SCRATCH_DIR ($GEONET_SCRATCH_DIR)."
+    echo "cannot continue."
+    exit 1
+fi
+
+
+[ -z "$GEONET_SDR_DATA_ROOT" ] && GEONET_SDR_DATA_ROOT=$GEONET_DATA/data/SDR
+( umask 2 && /bin/mkdir -p $GEONET_SDR_DATA_ROOT >/dev/null 2>&1 )
+if [ -d $GEONET_SDR_DATA_ROOT ]; then
+    :
+else
+    echo "cannot create the GEONET_SDR_DATA_ROOT \"$GEONET_SDR_DATA_ROOT\""
+    echo "cannot continue."
+    exit 1
+fi
+
+
+# Bug 6180. Re-Create/Rebuild the SDR if last termination was abnormal
+export SDR_AUTOCLEAN_MARKER=$GEONET_SDR_DATA_ROOT/.sdr_auto_clean
+if [ -f $SDR_AUTOCLEAN_MARKER ]; then
+    echo
+    echo
+    echo "abnormal SDR termination detected"
+
+    echo "re-creating empty SDR LUT"
+    create_lut
+
+    # echo "rebuilding SDR LUT"
+    # find $GEONET_SDR_DATA_ROOT -type f 2>/dev/null | grep '\.uff$' | catalog_uff_file -i
+
+    echo
+    echo
+fi
+
+touch $SDR_AUTOCLEAN_MARKER
+
+if [ -z "$GEONET_BASE_PORT" ]; then
+  GEONET_BASE_PORT=5000
+fi
+
+if [ -z "$JANUS_BASE_PORT" ]; then
+  JANUS_BASE_PORT=5500
+fi
+
+DCS_HOST="$(get_property $topdir/config/hostmap.properties dcs-host)"
+GEONET_DCS_PORT=$GEONET_BASE_PORT
+GEONET_TM_PORT=`expr $GEONET_BASE_PORT + 1`
+GEONET_SDR_PORT=`expr $GEONET_BASE_PORT + 6`
+
+GEONET_DCS_SERVER=s,:$GEONET_DCS_PORT
+GEONET_DCS_CLIENT=c,$DCS_HOST:$GEONET_DCS_PORT
+GEONET_TM_SERVER=s,:$GEONET_TM_PORT
+GEONET_TM_CLIENT=c,${GEONET_TM_NODE}:$GEONET_TM_PORT
+GEONET_SDR_SERVER=s,:$GEONET_SDR_PORT
+GEONET_SDR_CLIENT=c,${GEONET_TM_NODE}:$GEONET_SDR_PORT
+
+# begin slogd configuration section
+[ -z "$SLOG_LOG_FILE" ]      && SLOG_LOG_FILE=${GEONET_LOG_DIR}/${GEONET_SITE_ID}.log
+if [ -z "$SLOG_LOG_FILE_INET" ]; then
+  case $GEONET_TYPE in
+  ${nodeType_prefix}_nsp) SECOND_LOG_FILE_NAME=watcher;;
+  *) SECOND_LOG_FILE_NAME=tfdoa;;
+  esac
+  SLOG_LOG_FILE_INET=${GEONET_LOG_DIR}/${GEONET_SITE_ID}_${SECOND_LOG_FILE_NAME}.log
+fi
+
+[ -z "$SLOG_SOCKET_PATH" ] && SLOG_SOCKET_PATH=${GEONET_SCRATCH_DIR}/slog_socket
+[ -z "$SLOG_INET_PORT" ] && SLOG_INET_PORT=${GEONET_BASE_PORT} # UDP
+
+# SLOG_MAX_SIZE is in bytes
+if [ -z "$SLOG_MAX_SIZE" ]; then
+    if [ "$collector_type" = gate ]; then 
+	export SLOG_MAX_SIZE=600000000  # 600 MB for gate
+    else
+	export SLOG_MAX_SIZE=60000000   # 60 MB otherwise
+    fi
+fi
+
+copy_old_log_files $SLOG_LOG_FILE_INET 2
+
+export SLOG_LOG_FILE SLOG_LOG_FILE_INET SLOG_SOCKET_PATH SLOG_INET_PORT SLOG_MAX_SIZE
+# end slogd configuration section
+
+# Add UFF copy_old logs and remove datman files.
+
+rm ${GEONET_SCRATCH_DIR}/*_*.uff
+for i in ${GEONET_SCRATCH_DIR}/*.uff
+do
+  copy_old_log_files $i 2
+done
+
+#end UFF files copys.
+
+SHLIB_PATH=$LD_LIBRARY_PATH
+PERL5LIB=${libdir}/perl
+PATH=${bindir}:${toolsdir}:$PATH
+
+SRM_SOCKET_PATH=${GEONET_SCRATCH_DIR}/srm_socket
+SRMPUB_SOCKET_PATH=${GEONET_SCRATCH_DIR}/srmpub_socket
+
+export LD_LIBRARY_PATH SHLIB_PATH PERL5LIB SRM_SOCKET_PATH \
+    SRMPUB_SOCKET_PATH           \
+    GEONET_GEO_SOCKET            \
+    GEONET_DATA                  \
+    GEONET_LOG_DIR               \
+    GEONET_COMMON                \
+    GEONET_SITE_ID               \
+    GEONET_TM_SERVER             \
+    GEONET_TM_XML_SERVER         \
+    GEONET_TM_CLIENT             \
+    GEONET_SDR_DATA_ROOT         \
+    GEONET_SDR_SERVER            \
+    GEONET_SDR_CLIENT            \
+    GEONET_SCRATCH_DIR           \
+    GEONET_TYPE                  \
+    PATH                         \
+    GEONET_DCS_CLIENT
+
+
+the_waiter () {
+    wait
+}
+trap 'the_waiter' SIGCHLD
+
+
+#
+# start pre-TM programs
+#
+
+cleanup_pids=
+
+
+#
+# under bash-3 this loop could be written as
+# for (( i = 0 ; i < ${#pre_tm_startups[@]} ; i++ )) ; do
+#
+length=${#pre_tm_startups[@]};
+let "length -=1"
+
+i=0 ; while [ $i -lt $length ]; do
+    command=${pre_tm_startups[$i]}
+    $command & cleanup_pids="$! $cleanup_pids"
+    i=$((i+1))
+done
+
+command=${pre_tm_startups[$length]};
+$command 
+
+if [ -n "$cleanup_pids" ]; then
+    kill $cleanup_pids >/dev/null 2>&1
+    sleep 2
+    kill -9 $cleanup_pids >/dev/null 2>&1
+fi
+
+
+###############################################################################
+#
+# $Date: 2010-04-06 13:35:56 -0500 (Tue, 06 Apr 2010) $
+# $Revision: 90256 $
+#
+###############################################################################

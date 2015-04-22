@@ -1,0 +1,1 @@
+gcc test2.c -pthread -O2 -Wall -I/usr/include/python2.7

@@ -1,0 +1,2 @@
+-> Modify so that .so files are search for in same directory where it's run.
+-> What other ways can .so files be dynamically loaded?

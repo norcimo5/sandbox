@@ -1,0 +1,6 @@
+#!/usr/bin/tcc -run
+int main(void) 
+{
+    puts("This is just a test to see if this works!!!\n");
+    return 0;
+}
